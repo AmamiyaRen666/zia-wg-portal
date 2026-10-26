@@ -53,8 +53,11 @@ WG_ENDPOINT = "cktnph.509026.xyz:51820"
 WG_DNS = "10.8.0.1"
 WG_NETWORK = "10.8.0."  # clients get .2 - .254
 
-# Client private keys are generated per session (fake curve25519 base64 for demo)
-# In production you generate real X25519 keypairs.
+# Client private keys are generated per session as REAL X25519 keypairs
+# (see generate_client_keys). The client's public key is returned by
+# generate() so the server can register the peer; see /api/peer/add below.
+WG_SERVER_PRIVATE = os.environ.get("WG_SERVER_PRIVATE", "")  # never commit; set in env
+WG_ADMIN_TOKEN = os.environ.get("WG_ADMIN_TOKEN", "")  # protects peer-registration endpoint
 
 # ──────────────────────────────────────────────
 # APP
@@ -202,10 +205,33 @@ def generate_unique_name() -> str:
 
 
 def generate_client_keys() -> tuple[str, str]:
-    """Generate fake-but-valid-looking base64 WireGuard keys (32 bytes)."""
-    priv = base64.b64encode(secrets.token_bytes(32)).decode()
-    pub = base64.b64encode(secrets.token_bytes(32)).decode()
-    return priv, pub
+    """Generate a REAL WireGuard (X25519) keypair.
+
+    WireGuard uses X25519 (Curve25519 ECDH). The private key is 32 random
+    bytes (clamped by the curve), and the public key is X25519(private, 9).
+    Both are base64-encoded (32 bytes -> 44 chars incl. padding). This makes
+    the generated .conf actually connect to a real WireGuard server whose
+    [Peer] entry carries the client's public key.
+    """
+    try:
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        from cryptography.hazmat.primitives import serialization
+    except Exception as exc:  # cryptography not installed
+        raise RuntimeError(
+            "cryptography package required to generate real WireGuard keys: " + str(exc)
+        )
+
+    priv_key = X25519PrivateKey.generate()
+    priv_raw = priv_key.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    pub_raw = priv_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    return base64.b64encode(priv_raw).decode(), base64.b64encode(pub_raw).decode()
 
 
 def next_client_ip(sessions: Dict) -> str:
@@ -300,9 +326,26 @@ def generate():
     conf_path = CONFIGS_DIR / f"{name}.conf"
     conf_path.write_text(conf_text, encoding="utf-8")
 
+    # Generate the matching public key so the server can register this peer.
+    # (priv/pub are generated together; re-derive pub from priv for safety.)
+    try:
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        from cryptography.hazmat.primitives import serialization
+        import base64 as _b64
+        _priv_raw = _b64.b64decode(priv)
+        _pk = X25519PrivateKey.from_private_bytes(_priv_raw)
+        _pub_raw = _pk.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        client_pub = _b64.b64encode(_pub_raw).decode()
+    except Exception:
+        client_pub = None
+
     sessions[name] = {
         "name": name,
         "private_key": priv,
+        "public_key": client_pub,
         "client_ip": client_ip,
         "created_at": now_utc().isoformat(),
         "expires_at": expires.isoformat(),
@@ -311,6 +354,7 @@ def generate():
         "last_device_id": None,
         "last_player": None,
         "history": [],
+        "peer_registered": False,
     }
     save_sessions(sessions)
 
@@ -318,17 +362,27 @@ def generate():
     # Also support local testing: /login/<name>
     local_login = url_for("login_page", name=name, _external=True)
 
-    return jsonify({
+    resp = {
         "ok": True,
         "name": name,
         "filename": f"{name}.conf",
+        "client_public_key": client_pub,
+        "client_ip": client_ip,
+        "allowed_ips_entry": f"{client_ip}/32",
         "login_url": login_url,
         "local_login": local_login,
         "expires": format_expiry_pht(expires.isoformat()),
         "expires_raw": expires.isoformat(),
         "download": url_for("download_conf", name=name),
         "message": f"WireGuard Config: {name}",
-    })
+        "peer_snippet": (
+            f"[Peer]\n"
+            f"PublicKey = {client_pub}\n"
+            f"AllowedIPs = {client_ip}/32\n"
+            f"PersistentKeepalive = 25"
+        ) if client_pub else None,
+    }
+    return jsonify(resp)
 
 
 @app.route("/download/<name>")
@@ -546,7 +600,72 @@ def api_status(name: str):
 
 
 # ──────────────────────────────────────────────
-# CLEANUP THREAD (optional)
+# PEER REGISTRATION (admin) — adds client to server's wg0.conf
+# ──────────────────────────────────────────────
+def _require_admin():
+    tok = request.headers.get("X-Admin-Token") or request.args.get("token")
+    if WG_ADMIN_TOKEN and tok != WG_ADMIN_TOKEN:
+        abort(403)
+
+
+@app.route("/api/peer/add", methods=["POST"])
+def api_peer_add():
+    """Return the [Peer] block to paste into the WireGuard server config.
+
+    The portal does NOT touch the server directly (no SSH creds here). It
+    hands back the exact peer stanza + a wg-quick apply command. The operator
+    runs it on the server, OR wires up a small agent that calls `wg set`.
+    """
+    _require_admin()
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").replace(".conf", "").strip()
+    sessions = load_sessions()
+    sess = sessions.get(name)
+    if not sess:
+        return jsonify({"ok": False, "error": "session not found"}), 404
+    pub = sess.get("public_key")
+    ip = sess.get("client_ip")
+    if not pub or not ip:
+        return jsonify({"ok": False, "error": "no public key / ip"}), 400
+
+    stanza = (
+        f"[Peer]\n"
+        f"# {name}\n"
+        f"PublicKey = {pub}\n"
+        f"AllowedIPs = {ip}/32\n"
+        f"PersistentKeepalive = 25\n"
+    )
+    apply_cmd = (
+        f"wg set wg0 peer {pub} allowed-ips {ip}/32 persistent-keepalive 25"
+    )
+    sess["peer_registered"] = True
+    sessions[name] = sess
+    save_sessions(sessions)
+    return jsonify({
+        "ok": True,
+        "name": name,
+        "client_public_key": pub,
+        "client_ip": ip,
+        "stanza": stanza,
+        "apply_command": apply_cmd,
+        "note": "Run apply_command on the WireGuard server (or append stanza to wg0.conf + wg-quick down/up).",
+    })
+
+
+@app.route("/api/peer/list")
+def api_peer_list():
+    _require_admin()
+    sessions = load_sessions()
+    out = []
+    for n, s in sessions.items():
+        out.append({
+            "name": n,
+            "public_key": s.get("public_key"),
+            "client_ip": s.get("client_ip"),
+            "peer_registered": s.get("peer_registered", False),
+            "status": s.get("status"),
+        })
+    return jsonify(out)
 # ──────────────────────────────────────────────
 def _cleanup_loop():
     while True:
